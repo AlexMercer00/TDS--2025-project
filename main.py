@@ -1,12 +1,20 @@
-# main.py
 """
-LLM Code Deployment - fully implemented main server.
+LLM Code Deployment - Fully implemented and verified main server handler.
+
+This script orchestrates the following:
+1. Receives task requests (Round 1 or Round 2).
+2. Authenticates using the SECRET environment variable.
+3. Creates/updates a GitHub repository for the task.
+4. Handles and commits data URI attachments (e.g., data.csv, input.md).
+5. Calls the LLM to generate/modify application code.
+6. Enforces critical security and file path sanitization.
+7. Enables GitHub Pages for live deployment.
+8. Reports the final deployment status back to the evaluation system with exponential backoff.
 
 Usage:
- - Put required credentials in a .env file or environment:
-    GITHUB_TOKEN, GITHUB_USERNAME, SECRET, AIPIPE_TOKEN, OPENAI_BASE_URL (optional)
- - Run:
-    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+ - Ensure environment variables GITHUB_TOKEN, GITHUB_USERNAME, SECRET, and AIPIPE_TOKEN are set.
+ - Local run (not for production): uvicorn main:app --reload --host 0.0.0.0 --port 8000
+ - Production (Render) run command MUST use $PORT: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
 import os
@@ -37,6 +45,7 @@ if not all([GITHUB_TOKEN, GITHUB_USERNAME, SECRET]):
     raise Exception("Please set GITHUB_TOKEN, GITHUB_USERNAME, and SECRET in environment/.env")
 
 if not AIPIPE_TOKEN:
+    # This warning is acceptable, as the token may be provided just before runtime.
     print("Warning: AIPIPE_TOKEN not set. LLM generation will not work until you set AIPIPE_TOKEN.")
 
 API_BASE = "https://api.github.com"
@@ -98,9 +107,7 @@ def validate_llm_filepath(path: str) -> bool:
     # 2. Prevent hidden files/directories in the root (e.g., .env, .git, or just .)
     if path.startswith('.') and ('/' not in path):
         return False
-    # 3. Allow only standard file characters (alphanumeric, dots, dashes, underscores, spaces, slashes)
-    # The original regex `^[\w\-. /]+$` is fine, but simplified slightly for clarity and robustness.
-    # Note: GitHub allows spaces, but they complicate things, so standard path chars are preferred.
+    # 3. Allow only standard file characters
     if not re.match(r"^[\w\-. /]+$", path):
         return False
     return True
@@ -343,7 +350,6 @@ def run_round1(data: Dict) -> Dict:
     last_sha = commit_info.get("commit_sha") or ""
 
     prompt = f"Brief:\n{brief}\n\nIf attachments are needed, assume attachments are present under 'attachments/' path in the repo."
-    llm_succeeded = False
     try:
         llm_out = llm_generate(prompt)
         json_text = extract_json_block(llm_out)
@@ -380,9 +386,7 @@ def run_round1(data: Dict) -> Dict:
             resp = github_create_or_update_file(owner, repo_name, path, content.encode("utf-8"), f"feat: add generated file {path}")
             if isinstance(resp, dict) and 'content' in resp and 'sha' in resp['content']:
                 last_sha = resp['content']['sha']
-        
-        llm_succeeded = True
-        
+                
     except Exception as e:
         # LLM failure is not fatal; continue with initial commit SHA as fallback
         print(f"LLM generation skipped/failed: {str(e)[:200]}")
@@ -391,7 +395,7 @@ def run_round1(data: Dict) -> Dict:
     last_sha = github_get_latest_commit_sha(owner, repo_name) or last_sha
 
     if not last_sha:
-         raise Exception("Could not determine a commit SHA after deployment.")
+        raise Exception("Could not determine a commit SHA after deployment.")
 
     github_enable_pages(owner, repo_name)
     pages_url = f"https://{owner}.github.io/{repo_name}/"
@@ -484,6 +488,12 @@ def run_round2(data: Dict) -> Dict:
 # ------------------------
 app = FastAPI(title="LLM Code Deployment - Handler")
 
+# Add a GET endpoint for health checks and human users
+@app.get("/")
+def health_check():
+    """Simple health check endpoint that returns 200 OK."""
+    return {"status": "ok", "service": "LLM Code Deployment Handler", "version": "1.0"}
+
 
 @app.post("/handle_task")
 def handle_task(data: Dict = Body(...)):
@@ -516,6 +526,5 @@ def handle_task(data: Dict = Body(...)):
 # ------------------------
 if __name__ == "__main__":
     import uvicorn
-    # Note: uvicorn.run here will use the simple name `main:app` which is correct 
-    # when run directly or when called by the original run command: `uvicorn main:app --reload...`
+    # This block is for local testing only. Render uses the start command defined in the service settings.
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
