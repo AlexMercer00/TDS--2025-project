@@ -92,13 +92,15 @@ def validate_llm_filepath(path: str) -> bool:
     Prevents directory traversal (..), hidden files (.), and non-standard characters.
     """
     path = path.strip()
-    # 1. Prevent directory traversal
-    if '..' in path or path.startswith('/'):
+    # 1. Prevent directory traversal (e.g., ../, a/../b)
+    if '..' in path or path.startswith('/') or path.endswith('/'):
         return False
-    # 2. Prevent hidden files/directories in the root (e.g., .env, .git)
+    # 2. Prevent hidden files/directories in the root (e.g., .env, .git, or just .)
     if path.startswith('.') and ('/' not in path):
         return False
     # 3. Allow only standard file characters (alphanumeric, dots, dashes, underscores, spaces, slashes)
+    # The original regex `^[\w\-. /]+$` is fine, but simplified slightly for clarity and robustness.
+    # Note: GitHub allows spaces, but they complicate things, so standard path chars are preferred.
     if not re.match(r"^[\w\-. /]+$", path):
         return False
     return True
@@ -285,13 +287,16 @@ def commit_initial_files(owner: str, repo: str, parsed_attachments: List[Tuple[s
 def extract_json_block(text: str) -> str:
     """Extract the first raw JSON object from the LLM output text."""
     stripped = text.strip()
+    # Check for markdown code block format (```json ... ```)
     if stripped.startswith("```"):
         lines = stripped.split('\n')
-        if len(lines) > 2 and lines[-1].strip().startswith('```'):
+        if len(lines) > 2 and lines[-1].strip().endswith('```'):
             content = '\n'.join(lines[1:-1]).strip()
-            if content.startswith('json'):
+            # Remove optional 'json' language marker
+            if content.lower().startswith('json'):
                 content = content[4:].strip()
             return content
+    # Assume it might be raw JSON object if not a code block
     return stripped
 
 
@@ -334,9 +339,11 @@ def run_round1(data: Dict) -> Dict:
 
     parsed_attachments = parse_attachments(attachments)
     commit_info = commit_initial_files(owner, repo_name, parsed_attachments, task, nonce, brief)
+    # This SHA is the one *before* LLM generation commits
     last_sha = commit_info.get("commit_sha") or ""
 
     prompt = f"Brief:\n{brief}\n\nIf attachments are needed, assume attachments are present under 'attachments/' path in the repo."
+    llm_succeeded = False
     try:
         llm_out = llm_generate(prompt)
         json_text = extract_json_block(llm_out)
@@ -347,9 +354,14 @@ def run_round1(data: Dict) -> Dict:
 
         # Process LLM files
         for path, content in files_map.items():
-            if isinstance(content, (dict, list)):
+            # Ensure content is a string. If it was a valid JSON object/array itself, dump it back to string.
+            if isinstance(content, (dict, list, bool, int, float)):
                 content = json.dumps(content)
             
+            if not isinstance(content, str):
+                print(f"Skipping LLM-generated file {path}: content is not a string after processing.")
+                continue
+
             # --- START CRITICAL SANITIZATION ---
             if not validate_llm_filepath(path):
                  print(f"Refusing to commit file {path}: unsafe path detected.")
@@ -360,21 +372,26 @@ def run_round1(data: Dict) -> Dict:
                 print(f"Skipping LLM-generated file at restricted path: {path}")
                 continue
                 
-            if simple_secret_scan(str(content)):
+            if simple_secret_scan(content):
                 raise Exception(f"Generated file {path} appears to include secret-like content; aborting commit.")
             # --- END CRITICAL SANITIZATION ---
 
-            resp = github_create_or_update_file(owner, repo_name, path, str(content).encode("utf-8"), f"feat: add generated file {path}")
+            # CRITICAL FIX: Content is a string, encode it directly to bytes
+            resp = github_create_or_update_file(owner, repo_name, path, content.encode("utf-8"), f"feat: add generated file {path}")
             if isinstance(resp, dict) and 'content' in resp and 'sha' in resp['content']:
                 last_sha = resp['content']['sha']
-                
-        # CRITICAL FIX: Get the definitive last SHA after all LLM commits
-        last_sha = github_get_latest_commit_sha(owner, repo_name) or last_sha
-
+        
+        llm_succeeded = True
+        
     except Exception as e:
-        # LLM failure is not fatal; continue with initial commit SHA
+        # LLM failure is not fatal; continue with initial commit SHA as fallback
         print(f"LLM generation skipped/failed: {str(e)[:200]}")
-        # If LLM failed, last_sha remains the SHA from the initial commit_initial_files
+
+    # CRITICAL: Get the definitive last SHA after all commits (initial + LLM)
+    last_sha = github_get_latest_commit_sha(owner, repo_name) or last_sha
+
+    if not last_sha:
+         raise Exception("Could not determine a commit SHA after deployment.")
 
     github_enable_pages(owner, repo_name)
     pages_url = f"https://{owner}.github.io/{repo_name}/"
@@ -416,8 +433,14 @@ def run_round2(data: Dict) -> Dict:
 
     # Commit resulting files
     for path, content in files_map.items():
-        if isinstance(content, (dict, list)):
+        # Ensure content is a string. If it was a valid JSON object/array itself, dump it back to string.
+        if isinstance(content, (dict, list, bool, int, float)):
             content = json.dumps(content)
+        
+        if not isinstance(content, str):
+            print(f"Skipping LLM-generated file {path}: content is not a string after processing.")
+            continue
+
 
         # --- START CRITICAL SANITIZATION ---
         if not validate_llm_filepath(path):
@@ -428,20 +451,21 @@ def run_round2(data: Dict) -> Dict:
             print(f"Skipping LLM-generated file at restricted path: {path}")
             continue
 
-        if simple_secret_scan(str(content)):
+        if simple_secret_scan(content):
             raise Exception(f"Refusing to commit file {path}: secret-like content detected.")
         # --- END CRITICAL SANITIZATION ---
 
-        resp = github_create_or_update_file(owner, repo_name, path, str(content).encode("utf-8"), f"feat: round 2 update for {path}")
+        # CRITICAL FIX: Content is a string, encode it directly to bytes
+        resp = github_create_or_update_file(owner, repo_name, path, content.encode("utf-8"), f"feat: round 2 update for {path}")
         if isinstance(resp, dict) and 'content' in resp and 'sha' in resp['content']:
             last_sha = resp['content']['sha'] or last_sha
 
-    # CRITICAL FIX: Get the definitive last SHA after all changes
+    # CRITICAL: Get the definitive last SHA after all changes
     last_sha = github_get_latest_commit_sha(owner, repo_name) or last_sha
 
     if not last_sha:
-        # If LLM generated zero files, get the current HEAD SHA to report
-        last_sha = github_get_latest_commit_sha(owner, repo_name) or ""
+        # If LLM generated zero files, or no commits were found
+        raise Exception("Could not determine a commit SHA after Round 2 update.")
 
     try:
         github_enable_pages(owner, repo_name)
